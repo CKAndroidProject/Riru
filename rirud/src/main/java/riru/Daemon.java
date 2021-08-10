@@ -9,7 +9,6 @@ import android.os.SystemProperties;
 import android.util.Log;
 
 import java.io.File;
-import java.util.List;
 
 import riru.rirud.R;
 
@@ -20,19 +19,19 @@ public class Daemon implements IBinder.DeathRecipient {
     private static final String SERVICE_FOR_TEST = "activity";
     private static final String RIRU_LOADER = "libriruloader.so";
 
-    private final Handler handler;
-    private final String name;
-    private final DaemonSocketServerThread serverThread;
+    private final Handler handler = new Handler(Looper.myLooper());
+    private final DaemonSocketServerThread serverThread = new DaemonSocketServerThread();
+
+    private boolean allowRestart = true;
 
     private IBinder systemServerBinder;
 
     public Daemon() {
-        this.handler = new Handler(Looper.myLooper());
-        this.serverThread = new DaemonSocketServerThread();
-        this.name = SERVICE_FOR_TEST;
-
-        serverThread.start();
-        handler.post(() -> startWait(true, true));
+        // prevent zygote died after system server starts but before onRiruLoaded called
+        synchronized (serverThread) {
+            serverThread.start();
+            handler.post(() -> startWait(true));
+        }
     }
 
     @Override
@@ -40,15 +39,12 @@ public class Daemon implements IBinder.DeathRecipient {
         systemServerBinder.unlinkToDeath(this, 0);
         systemServerBinder = null;
 
-        DaemonUtils.setIsLoaded(false, false);
-        DaemonUtils.setIsLoaded(true, false);
-        DaemonUtils.getLoadedModules(false).clear();
-        DaemonUtils.getLoadedModules(true).clear();
+        DaemonUtils.clearLoadedProcess();
+        DaemonUtils.getLoadedModules().clear();
 
         DaemonUtils.writeStatus(R.string.zygote_dead);
 
         Log.i(TAG, "Zygote is probably dead, restart rirud socket...");
-        serverThread.restartServer();
 
         Log.i(TAG, "Zygote is probably dead, reset native bridge to " + RIRU_LOADER + "...");
         DaemonUtils.resetNativeBridgeProp(RIRU_LOADER);
@@ -56,10 +52,13 @@ public class Daemon implements IBinder.DeathRecipient {
         Log.i(TAG, "Zygote is probably dead, delete existing /dev/riru folders...");
         DaemonUtils.deleteDevFolder();
 
-        handler.post(() -> startWait(true, false));
+        synchronized (serverThread) {
+            serverThread.restartServer();
+            handler.post(() -> startWait(false));
+        }
     }
 
-    private void onRiruNotLoaded(boolean allowRestart, boolean isFirst) {
+    private void onRiruNotLoaded(boolean isFirst) {
         Log.w(TAG, "Riru is not loaded.");
 
         if (DaemonUtils.hasIncorrectFileContext()) {
@@ -98,6 +97,7 @@ public class Daemon implements IBinder.DeathRecipient {
         }
 
         if (allowRestart) {
+            allowRestart = false;
             handler.post(() -> {
                 Log.w(TAG, "Restarting zygote...");
                 if (DaemonUtils.has64Bit() && DaemonUtils.has32Bit()) {
@@ -106,17 +106,40 @@ public class Daemon implements IBinder.DeathRecipient {
                 } else {
                     SystemProperties.set("ctl.restart", "zygote");
                 }
-                startWait(false, false);
             });
+        } else {
+            Log.w(TAG, "Restarting zygote does not help");
         }
     }
 
     private void onRiruLoad() {
+        allowRestart = true;
         Log.i(TAG, "Riru loaded, reset native bridge to " + DaemonUtils.getOriginalNativeBridge() + "...");
         DaemonUtils.resetNativeBridgeProp(DaemonUtils.getOriginalNativeBridge());
 
         Log.i(TAG, "Riru loaded, stop rirud socket...");
         serverThread.stopServer();
+
+        var loadedModules = DaemonUtils.getLoadedModules().toArray();
+
+        StringBuilder sb = new StringBuilder();
+        if (loadedModules.length == 0) {
+            sb.append(DaemonUtils.res.getString(R.string.empty));
+        } else {
+            sb.append(loadedModules[0]);
+            for (int i = 1; i < loadedModules.length; ++i) {
+                sb.append(", ");
+                sb.append(loadedModules[i]);
+            }
+        }
+
+        DaemonUtils.writeStatus(R.string.loaded, loadedModules.length, sb);
+    }
+
+    private void startWait(boolean isFirst) {
+        systemServerBinder = DaemonUtils.waitForSystemService(SERVICE_FOR_TEST);
+
+        DaemonUtils.reloadLocale();
 
         try {
             systemServerBinder.linkToDeath(this, 0);
@@ -124,31 +147,12 @@ public class Daemon implements IBinder.DeathRecipient {
             Log.w(TAG, "linkToDeath", e);
         }
 
-        List<String> loadedModules = DaemonUtils.getLoadedModules(DaemonUtils.has64Bit());
-
-        StringBuilder sb = new StringBuilder();
-        if (loadedModules.isEmpty()) {
-            sb.append(DaemonUtils.res.getString(R.string.empty));
-        } else {
-            sb.append(loadedModules.get(0));
-            for (int i = 1; i < loadedModules.size(); i++) {
-                sb.append(", ");
-                sb.append(loadedModules.get(i));
+        synchronized (serverThread) {
+            if (!DaemonUtils.isLoaded()) {
+                onRiruNotLoaded(isFirst);
+            } else {
+                onRiruLoad();
             }
-        }
-
-        DaemonUtils.writeStatus(R.string.loaded, loadedModules.size(), sb);
-    }
-
-    private void startWait(boolean allowRestart, boolean isFirst) {
-        systemServerBinder = DaemonUtils.waitForSystemService(name);
-
-        DaemonUtils.reloadLocale();
-
-        if (!DaemonUtils.isLoaded(DaemonUtils.has64Bit())) {
-            onRiruNotLoaded(allowRestart, isFirst);
-        } else {
-            onRiruLoad();
         }
     }
 

@@ -1,5 +1,7 @@
 package riru;
 
+import static riru.Daemon.TAG;
+
 import android.content.res.AssetManager;
 import android.content.res.Configuration;
 import android.content.res.Resources;
@@ -25,16 +27,19 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.security.SecureRandom;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-
-import static riru.Daemon.TAG;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.FutureTask;
 
 public class DaemonUtils {
 
@@ -44,7 +49,6 @@ public class DaemonUtils {
     private static int ppid = -1;
     private static int magiskVersionCode = -1;
     private static String magiskTmpfsPath;
-    private static final boolean[] loaded = new boolean[2];
 
     public static Resources res;
 
@@ -55,18 +59,18 @@ public class DaemonUtils {
     private static final String RIRU_PREFIX = "libriru_";
     private static final String SO_SUFFIX = ".so";
 
-    private static final Map<String, List<Pair<String, String>>> modules = new HashMap<>();
-    private static final Map<String, List<Pair<String, String>>> modules64 = new HashMap<>();
+    private static final FutureTask<Map<String, List<Pair<String, String>>>> modules = new FutureTask<>(() -> collectModules(false));
+    private static final FutureTask<Map<String, List<Pair<String, String>>>> modules64 = new FutureTask<>(() -> collectModules(true));
 
-    @SuppressWarnings("unchecked")
-    private static final List<String>[] loadedModules = new List[]{new ArrayList<>(), new ArrayList<>()};
+    private static final Set<String> loadedModules = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     private static boolean isSELinuxEnforcing = false;
     private static boolean fileContext = true;
 
+    private static final Set<Integer> zygotePid = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
     static {
         originalNativeBridge = SystemProperties.get("ro.dalvik.vm.native.bridge");
-
         if (TextUtils.isEmpty(originalNativeBridge)) {
             originalNativeBridge = "0";
         }
@@ -88,20 +92,14 @@ public class DaemonUtils {
             Log.e(TAG, "load res", e);
         }
 
-        try {
-            if (has64Bit()) {
-                collectModules(true);
-            }
-        } catch (Throwable e) {
-            Log.e(TAG, "collect modules 64", e);
+        var service = Executors.newFixedThreadPool(2);
+
+        if (has64Bit()) {
+            service.submit(modules64);
         }
 
-        try {
-            if (has32Bit()) {
-                collectModules(false);
-            }
-        } catch (Throwable e) {
-            Log.e(TAG, "collect modules 32", e);
+        if (has32Bit()) {
+            service.submit(modules);
         }
 
         File magiskDir = new File(DaemonUtils.getMagiskTmpfsPath(), ".magisk/modules/riru-core");
@@ -127,16 +125,53 @@ public class DaemonUtils {
         magiskTmpfsPath = args[2];
     }
 
-    public static boolean isLoaded(boolean is64Bit) {
-        return loaded[is64Bit ? 1 : 0];
+    public static boolean isLoaded() {
+        var processes = new File("/proc").listFiles((file, s) -> TextUtils.isDigitsOnly(s));
+        if (processes == null) {
+            Log.w(TAG, "Could not list all processes");
+            return false;
+        }
+        for (var process : processes) {
+            var pid = Integer.parseInt(process.getName());
+            if (Objects.equals(SELinux.getPidContext(pid), "u:r:zygote:s0") && !zygotePid.contains(pid)) {
+                Log.w(TAG, "Process " + pid + " has zygote context but did not load riru");
+                return false;
+            }
+        }
+        return true;
     }
 
-    public static void setIsLoaded(boolean is64Bit, boolean riruIsLoaded) {
-        DaemonUtils.loaded[is64Bit ? 1 : 0] = riruIsLoaded;
+    public static void clearServiceManagerCache() {
+        try {
+            //noinspection JavaReflectionMemberAccess
+            Field field = ServiceManager.class.getDeclaredField("sServiceManager");
+            field.setAccessible(true);
+            field.set(null, null);
+
+            //noinspection JavaReflectionMemberAccess
+            field = ServiceManager.class.getDeclaredField("sCache");
+            field.setAccessible(true);
+            Object sCache = field.get(null);
+            if (sCache instanceof Map) {
+                //noinspection rawtypes
+                ((Map) sCache).clear();
+            }
+            Log.i(TAG, "clear ServiceManager");
+        } catch (Throwable e) {
+            Log.w(TAG, "clear ServiceManager: " + Log.getStackTraceString(e));
+        }
     }
 
-    public static List<String> getLoadedModules(boolean is64Bit) {
-        return loadedModules[is64Bit ? 1 : 0];
+    public static void clearLoadedProcess() {
+        zygotePid.clear();
+    }
+
+    public static void recordLoadedProcess(int pid) {
+        zygotePid.add(pid);
+    }
+
+    public static Set<String> getLoadedModules() {
+        return loadedModules;
     }
 
     public static void killParentProcess() {
@@ -253,6 +288,8 @@ public class DaemonUtils {
     }
 
     public static IBinder waitForSystemService(String name) {
+        clearServiceManagerCache();
+
         IBinder binder = null;
         do {
             try {
@@ -415,7 +452,7 @@ public class DaemonUtils {
         try {
             Os.close(fd);
         } catch (ErrnoException e) {
-            e.printStackTrace();
+            Log.w(TAG, Log.getStackTraceString(e));
         }
         return true;
     }
@@ -514,13 +551,13 @@ public class DaemonUtils {
         return res & checkAndResetContextForFile(to);
     }
 
-    private static void collectModules(boolean is64) {
-        Map<String, List<Pair<String, String>>> m = is64 ? modules64 : modules;
+    private static Map<String, List<Pair<String, String>>> collectModules(boolean is64) {
+        Map<String, List<Pair<String, String>>> m = new ConcurrentHashMap<>();
 
         String riruLibPath = "riru/" + (is64 ? "lib64" : "lib");
         File[] magiskDirs = new File(DaemonUtils.getMagiskTmpfsPath(), ".magisk/modules").listFiles();
         if (magiskDirs == null) {
-            return;
+            return Collections.emptyMap();
         }
 
         for (File magiskDir : magiskDirs) {
@@ -549,21 +586,31 @@ public class DaemonUtils {
                 else if (id.startsWith(LIB_PREFIX)) id = id.substring(LIB_PREFIX.length());
                 if (id.endsWith(SO_SUFFIX)) id = id.substring(0, id.length() - 3);
                 id = magiskDir.getName() + "@" + id;
-                if (!name.endsWith(SO_SUFFIX))
-                    lib = new File("/system/" + (is64 ? "lib64" : "lib"), name + SO_SUFFIX);
+                if (!name.endsWith(SO_SUFFIX)) {
+                    var relativeLibPath = "system/" + (is64 ? "lib64" : "lib");
+                    lib = new File(new File("/", relativeLibPath), name + SO_SUFFIX);
+                    fileContext &= checkAndResetContextForFile(new File(new File(magiskDir, relativeLibPath), name + SO_SUFFIX));
+                } else {
+                    fileContext &= checkAndResetContextForFile(lib);
+                }
 
                 libs.add(new Pair<>(id, lib.getAbsolutePath()));
                 Log.d(TAG, "Path for " + id + " is " + lib.getAbsolutePath());
 
-                fileContext &= checkAndResetContextForFile(lib);
             }
 
             fileContext &= checkOrResetContextForForParent(libDir, magiskDir);
         }
+        return m;
     }
 
     public static Map<String, List<Pair<String, String>>> getModules(boolean is64) {
-        return is64 ? modules64 : modules;
+        try {
+            return is64 ? modules64.get() : modules.get();
+        } catch (Throwable e) {
+            Log.e(TAG, "get modules", e);
+            return Collections.emptyMap();
+        }
     }
 
     public static boolean hasIncorrectFileContext() {

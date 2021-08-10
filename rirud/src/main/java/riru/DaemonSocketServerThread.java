@@ -1,8 +1,11 @@
 package riru;
 
+import static riru.Daemon.TAG;
+
 import android.net.Credentials;
 import android.net.LocalServerSocket;
 import android.net.LocalSocket;
+import android.os.SELinux;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -18,9 +21,13 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
@@ -28,8 +35,6 @@ import java.util.concurrent.Executors;
 import rikka.io.LittleEndianDataInputStream;
 import rikka.io.LittleEndianDataOutputStream;
 import riru.rirud.BuildConfig;
-
-import static riru.Daemon.TAG;
 
 public class DaemonSocketServerThread extends Thread {
 
@@ -40,13 +45,16 @@ public class DaemonSocketServerThread extends Thread {
     private static final int ACTION_WRITE_STATUS = 2;
     private static final int ACTION_READ_NATIVE_BRIDGE = 3;
     private static final int ACTION_READ_MAGISK_TMPFS_PATH = 6;
-
     private static final int ACTION_READ_MODULES = 7;
+
+    private static final HashSet<Integer> privateActions = new HashSet<>(Arrays.asList(ACTION_WRITE_STATUS, ACTION_READ_NATIVE_BRIDGE, ACTION_READ_MAGISK_TMPFS_PATH, ACTION_READ_MODULES));
 
     private static final Executor EXECUTOR = Executors.newFixedThreadPool(Runtime.getRuntime().availableProcessors() / 4 + 1);
 
     private LocalServerSocket serverSocket;
     private CountDownLatch countDownLatch;
+
+    private final Set<Integer> zygotePid = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     private void handleReadOriginalNativeBridge(LittleEndianDataOutputStream out) throws IOException {
         String s = DaemonUtils.getOriginalNativeBridge();
@@ -73,11 +81,11 @@ public class DaemonSocketServerThread extends Thread {
         }
     }
 
-    private void handleWriteStatus(LittleEndianDataInputStream in) throws IOException {
+    private void handleWriteStatus(LittleEndianDataInputStream in, Credentials credentials) throws IOException {
         boolean is64Bit = in.readBoolean();
         int count = in.readInt();
 
-        DaemonUtils.setIsLoaded(is64Bit, true);
+        DaemonUtils.recordLoadedProcess(credentials.getPid());
 
         File parent = new File("/dev/riru" + (is64Bit ? "64" : "") + "_" + DaemonUtils.getDevRandom());
         File modules = new File(parent, "modules");
@@ -119,7 +127,7 @@ public class DaemonSocketServerThread extends Thread {
 
             int index = id.indexOf('@');
             if (index != -1 && index < id.length()) {
-                DaemonUtils.getLoadedModules(is64Bit).add(id.substring(index + 1));
+                DaemonUtils.getLoadedModules().add(id.substring(index + 1));
             }
         }
     }
@@ -246,7 +254,7 @@ public class DaemonSocketServerThread extends Thread {
             writeString(out, magiskModulePath);
             out.writeInt(libs.size());
 
-            for (Pair<String, String> pair:libs){
+            for (Pair<String, String> pair : libs) {
                 String id = pair.first;
                 String lib = pair.second;
 
@@ -256,7 +264,7 @@ public class DaemonSocketServerThread extends Thread {
         }
     }
 
-    private void handleAction(LittleEndianDataInputStream in, LittleEndianDataOutputStream out, int action) throws IOException {
+    private void handleAction(LittleEndianDataInputStream in, LittleEndianDataOutputStream out, int action, Credentials credentials) throws IOException {
         Log.i(TAG, "Action " + action);
 
         switch (action) {
@@ -272,7 +280,7 @@ public class DaemonSocketServerThread extends Thread {
             }
             case ACTION_WRITE_STATUS: {
                 Log.i(TAG, "Action: write status");
-                handleWriteStatus(in);
+                handleWriteStatus(in, credentials);
                 break;
             }
             case ACTION_READ_FILE: {
@@ -298,9 +306,10 @@ public class DaemonSocketServerThread extends Thread {
         Log.i(TAG, "Handle action " + action + " finished");
     }
 
-    private void handleSocket(LocalSocket socket) throws IOException {
+    private void handleSocket(LocalSocket socket, boolean privateConnection) throws IOException {
         int action;
         boolean first = true;
+        var credentials = socket.getPeerCredentials();
 
         try (LittleEndianDataInputStream in = new LittleEndianDataInputStream(socket.getInputStream());
              LittleEndianDataOutputStream out = new LittleEndianDataOutputStream(socket.getOutputStream())) {
@@ -317,13 +326,18 @@ public class DaemonSocketServerThread extends Thread {
                     return;
                 }
 
-                handleAction(in, out, action);
+                if (!privateConnection && privateActions.contains(action)) {
+                    Log.e(TAG, "Unauthorized connection using private action");
+                    return;
+                }
+                handleAction(in, out, action, credentials);
                 first = false;
             }
         }
     }
 
     private void startServer() throws IOException {
+        zygotePid.clear();
         serverSocket = new LocalServerSocket("rirud");
 
         while (true) {
@@ -337,28 +351,27 @@ public class DaemonSocketServerThread extends Thread {
             }
 
             Credentials credentials = socket.getPeerCredentials();
-            if (credentials.getUid() != 0) {
+            var uid = credentials.getUid();
+            var pid = credentials.getPid();
+            var context = SELinux.getPidContext(pid);
+            if (uid != 0 || !Objects.equals(context, "u:r:zygote:s0")) {
                 socket.close();
-                Log.w(TAG, "Accept from non-root (" +
-                        "uid=" + credentials.getUid() + ", " +
-                        "pid=" + credentials.getPid() + ")");
+                Log.w(TAG, "Unauthorized peer (" +
+                        "uid=" + uid + ", " +
+                        "pid=" + pid + ", " +
+                        "context=" + context + ")");
                 continue;
             }
             Log.d(TAG, "Accepted " +
-                    "uid=" + credentials.getUid() + " " +
-                    "pid=" + credentials.getPid());
+                    "uid=" + uid + ", " +
+                    "pid=" + pid + ", " +
+                    "context=" + context);
 
             EXECUTOR.execute(() -> {
-                try {
-                    handleSocket(socket);
+                try (socket) {
+                    handleSocket(socket, zygotePid.add(pid));
                 } catch (Throwable e) {
                     Log.w(TAG, "Handle socket", e);
-                } finally {
-                    try {
-                        socket.close();
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
                 }
             });
         }
@@ -390,6 +403,7 @@ public class DaemonSocketServerThread extends Thread {
         }
 
         if (countDownLatch != null) {
+            zygotePid.clear();
             countDownLatch.countDown();
         }
     }
@@ -421,7 +435,7 @@ public class DaemonSocketServerThread extends Thread {
                 countDownLatch.await();
                 Log.i(TAG, "Restart server received");
             } catch (InterruptedException e) {
-                e.printStackTrace();
+                Log.w(TAG, Log.getStackTraceString(e));
             }
         }
     }
